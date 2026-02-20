@@ -8,30 +8,31 @@ from sqlglot.dialects.dialect import (
     NormalizationStrategy,
     array_append_sql,
     array_concat_sql,
-    build_timetostr_or_tochar,
-    build_like,
     binary_from_function,
     build_default_decimal_type,
+    build_formatted_time,
+    build_like,
     build_replace_with_optional_replacement,
+    build_timetostr_or_tochar,
+    build_trunc,
     date_delta_sql,
     date_trunc_to_time,
     datestrtodate_sql,
-    build_formatted_time,
+    groupconcat_sql,
     if_sql,
     inline_array_sql,
+    map_date_part,
     max_or_greatest,
     min_or_least,
+    no_make_interval_sql,
+    no_timestamp_sql,
     rename_func,
+    strposition_sql,
+    timestampdiff_sql,
     timestamptrunc_sql,
     timestrtotime_sql,
     unit_to_str,
     var_map_sql,
-    map_date_part,
-    no_timestamp_sql,
-    strposition_sql,
-    timestampdiff_sql,
-    no_make_interval_sql,
-    groupconcat_sql,
 )
 from sqlglot.generator import unsupported_args
 from sqlglot.helper import find_new_name, flatten, is_date_unit, is_int, seq_get
@@ -262,6 +263,15 @@ def _build_regexp_replace(args: t.List) -> exp.RegexpReplace:
     return regexp_replace
 
 
+def _build_regexp_like(args: t.List) -> exp.RegexpLike:
+    return exp.RegexpLike(
+        this=seq_get(args, 0),
+        expression=seq_get(args, 1),
+        flag=seq_get(args, 2),
+        full_match=True,
+    )
+
+
 def _show_parser(*args: t.Any, **kwargs: t.Any) -> t.Callable[[Snowflake.Parser], exp.Show]:
     def _parse(self: Snowflake.Parser) -> exp.Show:
         return self._parse_show_snowflake(*args, **kwargs)
@@ -443,7 +453,7 @@ def _regexpextract_sql(self, expression: exp.RegexpExtract | exp.RegexpExtractAl
     position = expression.args.get("position") or (occurrence and exp.Literal.number(1))
 
     return self.func(
-        "REGEXP_SUBSTR" if isinstance(expression, exp.RegexpExtract) else "REGEXP_EXTRACT_ALL",
+        "REGEXP_SUBSTR" if isinstance(expression, exp.RegexpExtract) else "REGEXP_SUBSTR_ALL",
         expression.this,
         expression.expression,
         position,
@@ -801,6 +811,11 @@ class Snowflake(Dialect):
 
         COLON_PLACEHOLDER_TOKENS = ID_VAR_TOKENS | {TokenType.NUMBER}
 
+        NO_PAREN_FUNCTIONS = {
+            **parser.Parser.NO_PAREN_FUNCTIONS,
+            TokenType.CURRENT_TIME: exp.Localtime,
+        }
+
         FUNCTIONS = {
             **parser.Parser.FUNCTIONS,
             "ADD_MONTHS": lambda args: exp.AddMonths(
@@ -809,10 +824,18 @@ class Snowflake(Dialect):
                 preserve_end_of_month=True,
             ),
             "APPROX_PERCENTILE": exp.ApproxQuantile.from_arg_list,
+            "CURRENT_TIME": lambda args: exp.Localtime(this=seq_get(args, 0)),
             "APPROX_TOP_K": _build_approx_top_k,
             "ARRAY_CONSTRUCT": lambda args: exp.Array(expressions=args),
             "ARRAY_CONTAINS": lambda args: exp.ArrayContains(
-                this=seq_get(args, 1), expression=seq_get(args, 0), ensure_variant=False
+                this=seq_get(args, 1),
+                expression=seq_get(args, 0),
+                ensure_variant=False,
+                check_null=True,
+            ),
+            "ARRAY_DISTINCT": lambda args: exp.ArrayDistinct(
+                this=seq_get(args, 0),
+                check_null=True,
             ),
             "ARRAY_GENERATE_RANGE": lambda args: exp.GenerateSeries(
                 # ARRAY_GENERATE_RANGE has an exlusive end; we normalize it to be inclusive
@@ -892,6 +915,11 @@ class Snowflake(Dialect):
             ),
             "HEX_DECODE_BINARY": exp.Unhex.from_arg_list,
             "IFF": exp.If.from_arg_list,
+            "JAROWINKLER_SIMILARITY": lambda args: exp.JarowinklerSimilarity(
+                this=seq_get(args, 0),
+                expression=seq_get(args, 1),
+                case_insensitive=True,
+            ),
             "MD5_HEX": exp.MD5.from_arg_list,
             "MD5_BINARY": exp.MD5Digest.from_arg_list,
             "MD5_NUMBER_LOWER64": exp.MD5NumberLower64.from_arg_list,
@@ -911,11 +939,12 @@ class Snowflake(Dialect):
                 this=seq_get(args, 0), permissive=seq_get(args, 1)
             ),
             "REGEXP_EXTRACT_ALL": _build_regexp_extract(exp.RegexpExtractAll),
+            "REGEXP_LIKE": _build_regexp_like,
             "REGEXP_REPLACE": _build_regexp_replace,
             "REGEXP_SUBSTR": _build_regexp_extract(exp.RegexpExtract),
             "REGEXP_SUBSTR_ALL": _build_regexp_extract(exp.RegexpExtractAll),
             "REPLACE": build_replace_with_optional_replacement,
-            "RLIKE": exp.RegexpLike.from_arg_list,
+            "RLIKE": _build_regexp_like,
             "ROUND": _build_round,
             "SHA1_BINARY": exp.SHA1Digest.from_arg_list,
             "SHA1_HEX": exp.SHA.from_arg_list,
@@ -941,6 +970,12 @@ class Snowflake(Dialect):
             "TIMESTAMP_FROM_PARTS": _build_timestamp_from_parts,
             "TIMESTAMPNTZFROMPARTS": _build_timestamp_from_parts,
             "TIMESTAMP_NTZ_FROM_PARTS": _build_timestamp_from_parts,
+            "TRUNC": lambda args, dialect: build_trunc(
+                args, dialect, date_trunc_requires_part=False
+            ),
+            "TRUNCATE": lambda args, dialect: build_trunc(
+                args, dialect, date_trunc_requires_part=False
+            ),
             "TRY_DECRYPT": lambda args: exp.Decrypt(
                 this=seq_get(args, 0),
                 passphrase=seq_get(args, 1),
@@ -1032,6 +1067,7 @@ class Snowflake(Dialect):
 
         ALTER_PARSERS = {
             **parser.Parser.ALTER_PARSERS,
+            "MODIFY": lambda self: self._parse_alter_table_alter(),
             "SESSION": lambda self: self._parse_alter_session(),
             "UNSET": lambda self: self.expression(
                 exp.Set,
@@ -1478,7 +1514,9 @@ class Snowflake(Dialect):
             while self._curr and not self._match(TokenType.R_PAREN, advance=False):
                 if self._match_texts(("DIMENSIONS", "METRICS", "FACTS")):
                     keyword = self._prev.text.lower()
-                    kwargs[keyword] = self._parse_csv(self._parse_disjunction)
+                    kwargs[keyword] = self._parse_csv(
+                        lambda: self._parse_alias(self._parse_disjunction(), explicit=True)
+                    )
                 elif self._match_text_seq("WHERE"):
                     kwargs["where"] = self._parse_expression()
                 else:
@@ -1495,6 +1533,19 @@ class Snowflake(Dialect):
                     if isinstance(expr, exp.SetItem):
                         expr.set("kind", "VARIABLE")
             return set
+
+        def _parse_window(
+            self, this: t.Optional[exp.Expression], alias: bool = False
+        ) -> t.Optional[exp.Expression]:
+            if isinstance(this, exp.NthValue):
+                if self._match_text_seq("FROM"):
+                    if self._match_texts(("FIRST", "LAST")):
+                        from_first = self._prev.text.upper() == "FIRST"
+                        this.set("from_first", from_first)
+
+            result = super()._parse_window(this, alias)
+
+            return result
 
     class Tokenizer(tokens.Tokenizer):
         STRING_ESCAPES = ["\\", "'"]
@@ -1603,6 +1654,10 @@ class Snowflake(Dialect):
             exp.CurrentTimestamp: lambda self, e: self.func("SYSDATE")
             if e.args.get("sysdate")
             else self.function_fallback_sql(e),
+            exp.CurrentSchemas: lambda self, e: self.func("CURRENT_SCHEMAS"),
+            exp.Localtime: lambda self, e: self.func("CURRENT_TIME", e.this)
+            if e.this
+            else "CURRENT_TIME",
             exp.Localtimestamp: lambda self, e: self.func("CURRENT_TIMESTAMP", e.this)
             if e.this
             else "CURRENT_TIMESTAMP",
@@ -1777,6 +1832,19 @@ class Snowflake(Dialect):
                 "SHA2_BINARY", e.this, e.args.get("length") or exp.Literal.number(256)
             ),
         }
+
+        def nthvalue_sql(self, expression: exp.NthValue) -> str:
+            result = self.func("NTH_VALUE", expression.this, expression.args.get("offset"))
+
+            from_first = expression.args.get("from_first")
+
+            if from_first is not None:
+                if from_first:
+                    result = result + " FROM FIRST"
+                else:
+                    result = result + " FROM LAST"
+
+            return result
 
         SUPPORTED_JSON_PATH_PARTS = {
             exp.JSONPathKey,

@@ -13,6 +13,7 @@ from sqlglot.dialects import DIALECT_MODULE_NAMES
 from sqlglot.errors import ParseError
 from sqlglot.generator import Generator, unsupported_args
 from sqlglot.helper import (
+    apply_index_offset,
     AutoName,
     flatten,
     is_int,
@@ -808,6 +809,9 @@ class Dialect(metaclass=_Dialect):
     Whether to prioritize non-literal types over literals during type annotation.
     """
 
+    ALIAS_POST_VERSION = True
+    """Whether the table alias comes after version (timestamp or iceberg snapshot)."""
+
     # --- Autofilled ---
 
     tokenizer_class = Tokenizer
@@ -1212,6 +1216,19 @@ DialectType = t.Union[str, Dialect, t.Type[Dialect], None]
 
 def rename_func(name: str) -> t.Callable[[Generator, exp.Expression], str]:
     return lambda self, expression: self.func(name, *flatten(expression.args.values()))
+
+
+def bracket_to_element_at_sql(self: Generator, expression: exp.Bracket) -> str:
+    index = seq_get(
+        apply_index_offset(
+            expression.this,
+            expression.expressions,
+            1 - expression.args.get("offset", 0),
+            dialect=self.dialect,
+        ),
+        0,
+    )
+    return self.func("ELEMENT_AT", expression.this, index)
 
 
 @unsupported_args("accuracy")
@@ -1756,7 +1773,7 @@ def encode_decode_sql(
     self: Generator, expression: exp.Expression, name: str, replace: bool = True
 ) -> str:
     charset = expression.args.get("charset")
-    if charset and charset.name.lower() != "utf-8":
+    if charset and charset.name.lower() not in ("utf-8", "utf8"):
         self.unsupported(f"Expected utf-8 character set, got {charset}.")
 
     return self.func(name, expression.this, expression.args.get("replace") if replace else None)
@@ -1868,6 +1885,46 @@ def binary_from_function(expr_type: t.Type[B]) -> t.Callable[[t.List], B]:
 # Used to represent DATE_TRUNC in Doris, Postgres and Starrocks dialects
 def build_timestamp_trunc(args: t.List) -> exp.TimestampTrunc:
     return exp.TimestampTrunc(this=seq_get(args, 1), unit=seq_get(args, 0))
+
+
+def build_trunc(
+    args: t.List,
+    dialect: DialectType,
+    date_trunc_unabbreviate: bool = True,
+    default_date_trunc_unit: t.Optional[str] = None,
+    date_trunc_requires_part: bool = True,
+) -> exp.DateTrunc | exp.Trunc | exp.Anonymous:
+    """
+    Builder for dialects with overloaded TRUNC (Oracle, Snowflake, etc).
+    Uses type annotation to distinguish date vs numeric truncation.
+    Returns Anonymous if type cannot be determined.
+    """
+    from sqlglot.optimizer.annotate_types import annotate_types
+
+    this = seq_get(args, 0)
+    second = seq_get(args, 1)
+
+    if this and not this.type:
+        this = annotate_types(this, dialect=dialect)
+    if second and not second.type:
+        second = annotate_types(second, dialect=dialect)
+
+    # Date truncation
+    if (
+        this and this.is_type(*exp.DataType.TEMPORAL_TYPES) and (second or default_date_trunc_unit)
+    ) or (second and second.is_type(*exp.DataType.TEXT_TYPES)):
+        unit = second or exp.Literal.string(default_date_trunc_unit)
+        return exp.DateTrunc(this=this, unit=unit, unabbreviate=date_trunc_unabbreviate)
+
+    # Numeric truncation
+    if (
+        (this and this.is_type(*exp.DataType.NUMERIC_TYPES))
+        or (second and second.is_type(*exp.DataType.NUMERIC_TYPES))
+        or (not date_trunc_requires_part and not second)
+    ):
+        return exp.Trunc(this=this, decimals=second)
+
+    return exp.Anonymous(this="TRUNC", expressions=args)
 
 
 def any_value_to_max_sql(self: Generator, expression: exp.AnyValue) -> str:
@@ -2153,20 +2210,53 @@ def filter_array_using_unnest(
     return self.sql(exp.Array(expressions=[filtered]))
 
 
-def remove_from_array_using_filter(
-    self: Generator, expression: exp.ArrayRemove | exp.ArrayCompact
-) -> str:
+def array_compact_sql(self: Generator, expression: exp.ArrayCompact) -> str:
     lambda_id = exp.to_identifier("_u")
-    if isinstance(expression, exp.ArrayRemove):
-        cond = exp.NEQ(this=lambda_id, expression=expression.expression)
-    else:
-        cond = exp.Is(this=lambda_id, expression=exp.null()).not_()
-
+    cond = exp.Is(this=lambda_id, expression=exp.null()).not_()
     return self.sql(
         exp.ArrayFilter(
-            this=expression.this, expression=exp.Lambda(this=cond, expressions=[lambda_id])
+            this=expression.this,
+            expression=exp.Lambda(this=cond, expressions=[lambda_id]),
         )
     )
+
+
+def remove_from_array_using_filter(self: Generator, expression: exp.ArrayRemove) -> str:
+    lambda_id = exp.to_identifier("_u")
+    cond = exp.NEQ(this=lambda_id, expression=expression.expression)
+
+    filter_sql = self.sql(
+        exp.ArrayFilter(
+            this=expression.this,
+            expression=exp.Lambda(this=cond, expressions=[lambda_id]),
+        )
+    )
+
+    # Handle NULL propagation for ArrayRemove
+    source_null_propagation = bool(expression.args.get("null_propagation"))
+    target_null_propagation = self.dialect.ARRAY_FUNCS_PROPAGATES_NULLS
+
+    # Source propagates NULLs (Snowflake), target doesn't (DuckDB):
+    # When removal value is NULL, return NULL instead of applying filter
+    if source_null_propagation and not target_null_propagation:
+        removal_value = expression.expression
+
+        # Optimization: skip wrapper if removal value is a non-NULL literal
+        # (e.g., 5, 'a', TRUE) or an array literal (e.g., [1, 2])
+        if (
+            isinstance(removal_value, exp.Literal) and not isinstance(removal_value, exp.Null)
+        ) or isinstance(removal_value, exp.Array):
+            return filter_sql
+
+        return self.sql(
+            exp.If(
+                this=exp.Is(this=removal_value, expression=exp.Null()),
+                true=exp.Null(),
+                false=filter_sql,
+            )
+        )
+
+    return filter_sql
 
 
 def to_number_with_nls_param(self: Generator, expression: exp.ToNumber) -> str:
@@ -2458,3 +2548,16 @@ def getbit_sql(self: Generator, expression: exp.Getbit) -> str:
         return self.sql(masked)
 
     return self.func("GET_BIT", value, position)
+
+
+def jarowinkler_similarity(func: str) -> t.Callable[[Generator, exp.JarowinklerSimilarity], str]:
+    def jarowinklersimilarity_sql(self: Generator, expression: exp.JarowinklerSimilarity) -> str:
+        this = expression.this
+        expr = expression.expression
+        if expression.args.get("case_insensitive"):
+            this = exp.Upper(this=this)
+            expr = exp.Upper(this=expr)
+
+        return self.func(func, this, expr)
+
+    return jarowinklersimilarity_sql

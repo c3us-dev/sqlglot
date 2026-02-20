@@ -9,6 +9,13 @@ class TestDuckDB(Validator):
     dialect = "duckdb"
 
     def test_duckdb(self):
+        # Numeric TRUNC - DuckDB only supports TRUNC(x), no decimals parameter
+        self.validate_identity("TRUNC(3.14)").assert_is(exp.Trunc)
+        self.validate_all(
+            "TRUNC(3.14159)",
+            read={"postgres": "TRUNC(3.14159, 2)"},
+        )
+
         self.validate_identity("SELECT ([1,2,3])[:-:-1]", "SELECT ([1, 2, 3])[:-1:-1]")
         self.validate_identity(
             "SELECT INTERVAL '1 hour'::VARCHAR", "SELECT CAST(INTERVAL '1' HOUR AS TEXT)"
@@ -821,7 +828,18 @@ class TestDuckDB(Validator):
             "SELECT ARRAY_LENGTH([0], 1) AS x",
             write={"duckdb": "SELECT ARRAY_LENGTH([0], 1) AS x"},
         )
-        self.validate_identity("REGEXP_REPLACE(this, pattern, replacement, modifiers)")
+        self.validate_identity("REGEXP_REPLACE(this, pattern, replacement)")
+        self.validate_identity("REGEXP_REPLACE(this, pattern, replacement, 'g')")
+        self.validate_identity("REGEXP_REPLACE(this, pattern, replacement, 'gi')")
+        self.validate_identity("REGEXP_REPLACE(this, pattern, replacement, 'ims')")
+
+        self.validate_identity(
+            "SELECT NTH_VALUE(is_deleted, 2) OVER (PARTITION BY id) AS nth_is_deleted FROM my_table"
+        )
+        self.validate_identity(
+            "SELECT NTH_VALUE(is_deleted, 2 IGNORE NULLS) OVER (PARTITION BY id) AS nth_is_deleted FROM my_table"
+        )
+
         self.validate_all(
             "REGEXP_MATCHES(x, y)",
             write={
@@ -920,6 +938,8 @@ class TestDuckDB(Validator):
                 "spark": "ARRAY_SUM(ARRAY(1, 2))",
             },
         )
+        self.validate_identity("SELECT LIST_MAX(values) FROM table1")
+        self.validate_identity("SELECT LIST_MIN(values) FROM table1")
         self.validate_all(
             "STRUCT_PACK(x := 1, y := '2')",
             write={
@@ -1068,12 +1088,28 @@ class TestDuckDB(Validator):
                 "snowflake": "SELECT REGEXP_SUBSTR(a, 'pattern', 1, 1, 'i', 2) FROM t",
             },
         )
+        # group=0 is the default and gets normalized away when no following params
         self.validate_identity(
             "SELECT REGEXP_EXTRACT(a, 'pattern', 0)",
             "SELECT REGEXP_EXTRACT(a, 'pattern')",
         )
+        # group is kept when there are following params (flags)
         self.validate_identity("SELECT REGEXP_EXTRACT(a, 'pattern', 0, 'i')")
         self.validate_identity("SELECT REGEXP_EXTRACT(a, 'pattern', 1, 'i')")
+
+        # REGEXP_EXTRACT_ALL round-trip tests (same normalization rules as REGEXP_EXTRACT)
+        self.validate_identity(
+            "SELECT REGEXP_EXTRACT_ALL(s, 'pattern', 0)",
+            "SELECT REGEXP_EXTRACT_ALL(s, 'pattern')",
+        )
+        self.validate_identity("SELECT REGEXP_EXTRACT_ALL(s, 'pattern', 1)")
+        self.validate_identity("SELECT REGEXP_EXTRACT_ALL(s, 'pattern', 0, 'i')")
+        self.validate_identity("SELECT REGEXP_EXTRACT_ALL(s, 'pattern', 1, 'im')")
+        # Array slicing for occurrence
+        self.validate_identity(
+            "SELECT REGEXP_EXTRACT_ALL(s, 'pattern', 0)[2:]",
+            "SELECT REGEXP_EXTRACT_ALL(s, 'pattern')[2:]",
+        )
 
         self.validate_identity("SELECT ISNAN(x)")
 
@@ -1136,6 +1172,7 @@ class TestDuckDB(Validator):
             },
         )
         self.validate_identity("EDITDIST3(col1, col2)", "LEVENSHTEIN(col1, col2)")
+        self.validate_identity("JARO_WINKLER_SIMILARITY('hello', 'world')")
 
         self.validate_identity("SELECT LENGTH(foo)")
         self.validate_identity("SELECT ARRAY[1, 2, 3]", "SELECT [1, 2, 3]")
@@ -1355,7 +1392,9 @@ class TestDuckDB(Validator):
         self.validate_identity("ROUND(2.256, 1)")
 
         # TODO: This is incorrect AST, DATE_PART creates a STRUCT of values but it's stored in 'year' arg
-        self.validate_identity("SELECT MAKE_DATE(DATE_PART(['year', 'month', 'day'], TODAY()))")
+        self.validate_identity(
+            "SELECT MAKE_DATE(DATE_PART(['year', 'month', 'day'], CURRENT_DATE))"
+        )
 
         self.validate_identity("SELECT * FROM t PIVOT(SUM(y) FOR foo IN y_enum)")
         self.validate_identity("SELECT 20_000 AS literal")
@@ -1393,7 +1432,16 @@ class TestDuckDB(Validator):
             },
         )
 
+        self.validate_all(
+            "ARRAY_CONTAINS(MAP_KEYS(CAST({'k1': 'v1', 'k2': 'v2', 'k3': 'v3'} AS MAP(TEXT, TEXT))), 'k1')",
+            read={
+                "snowflake": "MAP_CONTAINS_KEY('k1', {'k1': 'v1', 'k2': 'v2', 'k3': 'v3'}::MAP(VARCHAR, VARCHAR))",
+            },
+        )
+
         self.validate_identity("SELECT [1, 2, 3][1 + 1:LENGTH([1, 2, 3]) + -1]")
+        self.validate_identity("VERSION()")
+        self.validate_identity("SELECT TODAY()", "SELECT CURRENT_DATE")
 
     def test_array_index(self):
         with self.assertLogs(helper_logger) as cm:
@@ -1473,6 +1521,96 @@ class TestDuckDB(Validator):
                 "": "ARRAY_INSERT([1, 2, 3], -1, 99)",
                 "snowflake": "ARRAY_INSERT([1, 2, 3], -1, 99)",
                 "spark": "ARRAY_INSERT(ARRAY(1, 2, 3), -2, 99)",
+            },
+        )
+
+    def test_array_remove(self):
+        # Test NULL propagation with column reference: Snowflake → DuckDB
+        self.validate_all(
+            "CASE WHEN target IS NULL THEN NULL ELSE LIST_FILTER(the_array, _u -> _u <> target) END",
+            read={
+                "snowflake": "ARRAY_REMOVE(the_array, target)",
+            },
+        )
+
+        # Test literal values: Snowflake → DuckDB
+        self.validate_all(
+            "LIST_FILTER([1, 2, 3], _u -> _u <> 2)",
+            read={
+                "snowflake": "ARRAY_REMOVE([1, 2, 3], 2)",
+            },
+        )
+
+        # Test NULL literal: Snowflake → DuckDB
+        self.validate_all(
+            "CASE WHEN NULL IS NULL THEN NULL ELSE LIST_FILTER([1, 2, 3], _u -> _u <> NULL) END",
+            read={
+                "snowflake": "ARRAY_REMOVE([1, 2, 3], NULL)",
+            },
+        )
+
+    def test_array_remove_at(self):
+        # Test remove first element (position 0)
+        self.validate_all(
+            "CASE WHEN [1, 2, 3] IS NULL THEN NULL ELSE [1, 2, 3][2:] END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], 0)",
+            },
+        )
+
+        # Test remove middle element (position 1)
+        self.validate_all(
+            "CASE WHEN [1, 2, 3] IS NULL THEN NULL ELSE LIST_CONCAT([1, 2, 3][1:1], [1, 2, 3][3:]) END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], 1)",
+            },
+        )
+
+        # Test remove last element with positive index (position 2 for 3-element array)
+        self.validate_all(
+            "CASE WHEN [1, 2, 3] IS NULL THEN NULL ELSE LIST_CONCAT([1, 2, 3][1:2], [1, 2, 3][4:]) END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], 2)",
+            },
+        )
+
+        # Test remove last element with negative index (position -1)
+        self.validate_all(
+            "CASE WHEN [1, 2, 3] IS NULL THEN NULL ELSE [1, 2, 3][1:LENGTH([1, 2, 3]) + -1] END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], -1)",
+            },
+        )
+
+        # Test remove second-to-last element (position -2)
+        self.validate_all(
+            "CASE WHEN [1, 2, 3] IS NULL THEN NULL ELSE LIST_CONCAT([1, 2, 3][1:LENGTH([1, 2, 3]) + -2], [1, 2, 3][LENGTH([1, 2, 3]) + -2 + 2:]) END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], -2)",
+            },
+        )
+
+        # Test single element array
+        self.validate_all(
+            "CASE WHEN [99] IS NULL THEN NULL ELSE [99][2:] END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([99], 0)",
+            },
+        )
+
+        # Test NULL array with column reference
+        self.validate_all(
+            "CASE WHEN arr IS NULL THEN NULL ELSE arr[2:] END",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT(arr, 0)",
+            },
+        )
+
+        # Test non-literal position (should remain untranspiled)
+        self.validate_all(
+            "ARRAY_REMOVE_AT([1, 2, 3], pos)",
+            read={
+                "snowflake": "ARRAY_REMOVE_AT([1, 2, 3], pos)",
             },
         )
 
@@ -1906,6 +2044,13 @@ class TestDuckDB(Validator):
             },
         )
 
+    def test_sha(self):
+        # Round-trip: DuckDB SHA1 should not add unnecessary casts
+        self.validate_identity("SHA1('foo')")
+        self.validate_identity("SHA1(x)")
+        self.validate_identity("SHA256('foo')")
+        self.validate_identity("SHA256(x)")
+
     def test_rename_table(self):
         self.validate_all(
             "ALTER TABLE db.t1 RENAME TO db.t2",
@@ -2313,4 +2458,40 @@ class TestDuckDB(Validator):
         self.assertEqual(
             expr.sql(dialect="duckdb"),
             "SELECT CAST(APPROX_QUANTILE(CAST(a AS DOUBLE), 0.5) AS DOUBLE) FROM t",
+        )
+
+    def test_current_database(self):
+        self.validate_all(
+            "SELECT CURRENT_DATABASE()",
+            read={
+                "snowflake": "SELECT CURRENT_DATABASE()",
+            },
+            write={
+                "duckdb": "SELECT CURRENT_DATABASE()",
+                "snowflake": "SELECT CURRENT_DATABASE()",
+            },
+        )
+
+    def test_current_schema(self):
+        self.validate_all(
+            "SELECT CURRENT_SCHEMA()",
+            read={
+                "snowflake": "SELECT CURRENT_SCHEMA()",
+            },
+            write={
+                "duckdb": "SELECT CURRENT_SCHEMA()",
+                "snowflake": "SELECT CURRENT_SCHEMA()",
+            },
+        )
+
+    def test_current_schemas(self):
+        self.validate_all(
+            "SELECT CURRENT_SCHEMAS(TRUE)",
+            read={
+                "snowflake": "SELECT CURRENT_SCHEMAS()",
+            },
+            write={
+                "duckdb": "SELECT CURRENT_SCHEMAS(TRUE)",
+                "snowflake": "SELECT CURRENT_SCHEMAS()",
+            },
         )

@@ -1286,7 +1286,19 @@ FROM foo""",
         assert expr == expr
 
     def test_literal_number(self):
-        for number in (1, -1.1, 1.1, 0, "-1", "1", "1.1", "-1.1", "1e6"):
+        for number in (
+            1,
+            -1.1,
+            1.1,
+            0,
+            "-1",
+            "1",
+            "1.1",
+            "-1.1",
+            "1e6",
+            "inf",
+            "binary_double_nan",
+        ):
             with self.subTest(f"Test Literal number method for: {repr(number)}"):
                 literal = exp.Literal.number(number)
 
@@ -1308,3 +1320,11 @@ FROM foo""",
                     this = literal.this
 
                 self.assertEqual(this, expected_this)
+
+    def test_update_positions_empty_meta(self):
+        expr1 = exp.Column(this="a")
+        expr2 = exp.Column(this="b")
+        expr2.meta.clear()
+
+        expr1.update_positions(expr2)
+        assert expr1.meta == {}

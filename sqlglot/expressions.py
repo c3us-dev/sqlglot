@@ -918,7 +918,8 @@ class Expression(metaclass=_Expression):
             self.meta["end"] = end
         elif hasattr(other, "meta"):
             for k in POSITION_META_KEYS:
-                self.meta[k] = other.meta[k]
+                if k in other.meta:
+                    self.meta[k] = other.meta[k]
         else:
             self.meta["line"] = other.line
             self.meta["col"] = other.col
@@ -1566,7 +1567,6 @@ class Create(DDL):
         "indexes": False,
         "no_schema_binding": False,
         "begin": False,
-        "end": False,
         "clone": False,
         "concurrently": False,
         "clustered": False,
@@ -1588,6 +1588,35 @@ class SequenceProperties(Expression):
         "owned": False,
         "options": False,
     }
+
+
+# https://www.postgresql.org/docs/current/sql-createtrigger.html
+class TriggerProperties(Expression):
+    arg_types = {
+        "table": True,
+        "timing": True,
+        "events": True,
+        "execute": True,
+        "constraint": False,
+        "referenced_table": False,
+        "deferrable": False,
+        "initially": False,
+        "referencing": False,
+        "for_each": False,
+        "when": False,
+    }
+
+
+class TriggerExecute(Expression):
+    pass
+
+
+class TriggerEvent(Expression):
+    arg_types = {"this": True, "columns": False}
+
+
+class TriggerReferencing(Expression):
+    arg_types = {"old": False, "new": False}
 
 
 class TruncateTable(Expression):
@@ -2139,7 +2168,7 @@ class ComputedColumnConstraint(ColumnConstraintKind):
 
 # https://docs.oracle.com/en/database/other-databases/timesten/22.1/plsql-developer/examples-using-input-and-output-parameters-and-bind-variables.html#GUID-4B20426E-F93F-4835-88CB-6A79829A8D7F
 class InOutColumnConstraint(ColumnConstraintKind):
-    arg_types = {"input_": False, "output": False}
+    arg_types = {"input_": False, "output": False, "variadic": False}
 
 
 class Constraint(Expression):
@@ -2612,11 +2641,14 @@ class Literal(Condition):
     def number(cls, number) -> Literal | Neg:
         expr: Literal | Neg = cls(this=str(number), is_string=False)
 
-        to_py = expr.to_py()
+        try:
+            to_py = expr.to_py()
 
-        if not isinstance(to_py, str) and to_py < 0:
-            expr.set("this", str(abs(to_py)))
-            expr = Neg(this=expr)
+            if not isinstance(to_py, str) and to_py < 0:
+                expr.set("this", str(abs(to_py)))
+                expr = Neg(this=expr)
+        except Exception:
+            pass
 
         return expr
 
@@ -3944,6 +3976,8 @@ class Lock(Expression):
     arg_types = {"update": True, "expressions": False, "wait": False, "key": False}
 
 
+# In Redshift, * and EXCLUDE can be separated with column projections (e.g., SELECT *, col1 EXCLUDE (col2))
+# The "exclude" arg enables correct parsing and transpilation of this clause
 class Select(Query):
     arg_types = {
         "with_": False,
@@ -3954,6 +3988,7 @@ class Select(Query):
         "into": False,
         "from_": False,
         "operation_modifiers": False,
+        "exclude": False,
         **QUERY_MODIFIERS,
     }
 
@@ -4682,7 +4717,6 @@ class DataType(Expression):
         "expressions": False,
         "nested": False,
         "values": False,
-        "prefix": False,
         "kind": False,
         "nullable": False,
     }
@@ -4959,7 +4993,10 @@ class DataType(Expression):
         else:
             raise ValueError(f"Invalid data type: {type(dtype)}. Expected str or DataType.Type")
 
-        return DataType(**{**data_type_exp.args, **kwargs})
+        if kwargs:
+            for k, v in kwargs.items():
+                data_type_exp.set(k, v)
+        return data_type_exp
 
     def is_type(self, *dtypes: DATA_TYPE, check_nullable: bool = False) -> bool:
         """
@@ -5696,7 +5733,7 @@ class ManhattanDistance(Func):
 
 
 class JarowinklerSimilarity(Func):
-    arg_types = {"this": True, "expression": True}
+    arg_types = {"this": True, "expression": True, "case_insensitive": False}
 
 
 class AggFunc(Func):
@@ -5765,7 +5802,7 @@ class JSONBool(Func):
 
 
 class ArrayRemove(Func):
-    arg_types = {"this": True, "expression": True}
+    arg_types = {"this": True, "expression": True, "null_propagation": False}
 
 
 class ParameterizedAgg(AggFunc):
@@ -6112,13 +6149,17 @@ class ArrayInsert(Func):
     arg_types = {"this": True, "position": True, "expression": True, "offset": False}
 
 
+class ArrayRemoveAt(Func):
+    arg_types = {"this": True, "position": True}
+
+
 class ArrayConstructCompact(Func):
     arg_types = {"expressions": False}
     is_var_len_args = True
 
 
 class ArrayContains(Binary, Func):
-    arg_types = {"this": True, "expression": True, "ensure_variant": False}
+    arg_types = {"this": True, "expression": True, "ensure_variant": False, "check_null": False}
     _sql_names = ["ARRAY_CONTAINS", "ARRAY_HAS"]
 
 
@@ -6158,6 +6199,10 @@ class ArrayIntersect(Func):
     _sql_names = ["ARRAY_INTERSECT", "ARRAY_INTERSECTION"]
 
 
+class ArrayExcept(Func):
+    arg_types = {"this": True, "expression": True}
+
+
 class StPoint(Func):
     arg_types = {"this": True, "expression": True, "null": False}
     _sql_names = ["ST_POINT", "ST_MAKEPOINT"]
@@ -6192,6 +6237,18 @@ class ArraySort(Func):
 
 class ArraySum(Func):
     arg_types = {"this": True, "expression": False}
+
+
+class ArrayDistinct(Func):
+    arg_types = {"this": True, "check_null": False}
+
+
+class ArrayMax(Func):
+    pass
+
+
+class ArrayMin(Func):
+    pass
 
 
 class ArrayUnionAgg(AggFunc):
@@ -6238,7 +6295,7 @@ class LastValue(AggFunc):
 
 
 class NthValue(AggFunc):
-    arg_types = {"this": True, "offset": True}
+    arg_types = {"this": True, "offset": True, "from_first": False}
 
 
 class ObjectAgg(AggFunc):
@@ -7105,6 +7162,10 @@ class IsNullValue(Func):
     pass
 
 
+class IsArray(Func):
+    pass
+
+
 # https://www.postgresql.org/docs/current/functions-json.html
 class JSON(Expression):
     arg_types = {"this": False, "with_": False, "unique": False}
@@ -7330,6 +7391,10 @@ class OpenJSONColumnDef(Expression):
 
 class OpenJSON(Func):
     arg_types = {"this": True, "path": False, "expressions": False}
+
+
+class ObjectId(Func):
+    arg_types = {"this": True, "expression": False}
 
 
 class JSONBContains(Binary, Func):
@@ -7880,7 +7945,7 @@ class RegexpReplace(Func):
 
 
 class RegexpLike(Binary, Func):
-    arg_types = {"this": True, "expression": True, "flag": False}
+    arg_types = {"this": True, "expression": True, "flag": False, "full_match": False}
 
 
 class RegexpILike(Binary, Func):
@@ -7984,6 +8049,14 @@ class Round(Func):
         "truncate": False,
         "casts_non_integer_decimals": False,
     }
+
+
+# Numeric truncation - distinct from DateTrunc/TimestampTrunc
+# Most dialects: TRUNC(number, decimals) or TRUNCATE(number, decimals)
+# T-SQL: ROUND(number, decimals, 1) - handled in generator
+class Trunc(Func):
+    arg_types = {"this": True, "decimals": False}
+    _sql_names = ["TRUNC", "TRUNCATE"]
 
 
 class RowNumber(Func):
@@ -8541,10 +8614,40 @@ class Variadic(Expression):
     pass
 
 
+class StoredProcedure(Expression):
+    arg_types = {"this": True, "expressions": False, "wrapped": False}
+
+
+class Block(Expression):
+    arg_types = {"expressions": True}
+
+
+class IfBlock(Expression):
+    arg_types = {"this": True, "true": True, "false": False}
+
+
+class WhileBlock(Expression):
+    arg_types = {"this": True, "body": True}
+
+
+class EndStatement(Expression):
+    arg_types = {}
+
+
+class Execute(Expression):
+    arg_types = {"this": True, "expressions": False}
+
+    @property
+    def name(self) -> str:
+        return self.this.name
+
+
+class ExecuteSql(Execute):
+    pass
+
+
 ALL_FUNCTIONS = subclasses(__name__, Func, {AggFunc, Anonymous, Func})
 FUNCTION_BY_NAME = {name: func for func in ALL_FUNCTIONS for name in func.sql_names()}
-
-JSON_PATH_PARTS = subclasses(__name__, JSONPathPart, {JSONPathPart})
 
 PERCENTILES = (PercentileCont, PercentileDisc)
 

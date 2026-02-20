@@ -15,28 +15,21 @@ EXPRESSION_METADATA = {
     **{
         expr_type: {"returns": exp.DataType.Type.DOUBLE}
         for expr_type in {
-            exp.Asin,
-            exp.Acos,
-            exp.Atan,
             exp.Corr,
-            exp.Cos,
-            exp.Cosh,
             exp.MonthsBetween,
-            exp.Sin,
-            exp.Sinh,
-            exp.Tan,
-            exp.Tanh,
         }
     },
     **{
         expr_type: {"returns": exp.DataType.Type.VARCHAR}
         for expr_type in {
-            exp.CurrentCatalog,
+            exp.AddMonths,
             exp.CurrentDatabase,
-            exp.CurrentSchema,
             exp.CurrentUser,
+            exp.CurrentSchema,
             exp.Hex,
-            exp.MD5,
+            exp.NextDay,
+            exp.Repeat,
+            exp.Replace,
             exp.Soundex,
         }
     },
@@ -51,12 +44,16 @@ EXPRESSION_METADATA = {
         expr_type: {"returns": exp.DataType.Type.INT}
         for expr_type in {
             exp.Month,
-            exp.Quarter,
             exp.Second,
         }
     },
+    exp.ApproxQuantile: {"annotator": lambda self, e: self._annotate_by_args(e, "quantile")},
+    exp.ArrayIntersect: {"annotator": lambda self, e: self._annotate_by_args(e, "expressions")},
     exp.Coalesce: {
         "annotator": lambda self, e: self._annotate_by_args(e, "this", "expressions", promote=True)
     },
     exp.If: {"annotator": lambda self, e: self._annotate_by_args(e, "true", "false", promote=True)},
+    exp.Quantile: {"annotator": lambda self, e: self._annotate_by_args(e, "quantile")},
+    exp.RegexpSplit: {"returns": exp.DataType.build("ARRAY<STRING>")},
+    exp.Reverse: {"annotator": lambda self, e: self._annotate_by_args(e, "this")},
 }
